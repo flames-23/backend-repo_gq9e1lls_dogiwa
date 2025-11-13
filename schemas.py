@@ -5,12 +5,13 @@ Madad MVP collections using MongoDB with Pydantic models for validation.
 Each Pydantic model name maps to a MongoDB collection with the lowercase name.
 
 Collections:
+- User: app users with email/phone login and hashed passwords (JWT auth)
 - Vendor: registered service providers with geolocation (GeoJSON Point)
 - Payment: records of vendor subscription payments (MVP: manual status tracking)
 """
 
 from pydantic import BaseModel, Field, EmailStr
-from typing import Optional, Literal, List, Dict, Any
+from typing import Optional, Literal, List
 
 ServiceType = Literal[
     "tow_truck",
@@ -27,6 +28,23 @@ class GeoPoint(BaseModel):
     # GeoJSON expects [longitude, latitude]
     coordinates: List[float] = Field(..., min_items=2, max_items=2, description="[lng, lat]")
 
+class User(BaseModel):
+    name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    phone: Optional[str] = None
+    password: str = Field(..., min_length=6)
+
+class UserOut(BaseModel):
+    id: str
+    name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    phone: Optional[str] = None
+
+class LoginRequest(BaseModel):
+    email: Optional[EmailStr] = None
+    phone: Optional[str] = None
+    password: str
+
 class Vendor(BaseModel):
     name: str = Field(..., description="Vendor display name")
     phone: str = Field(..., description="Primary contact phone number in local format")
@@ -36,7 +54,6 @@ class Vendor(BaseModel):
     description: Optional[str] = Field(None, description="Short description or specialties")
     approved: bool = Field(False, description="Admin approval status")
     verified: bool = Field(False, description="Manual vendor verification status")
-    # MVP payments: manual approval; future: integrate Easypaisa/JazzCash
     payment_status: Literal["unpaid", "active", "expired"] = Field("unpaid")
 
 class Payment(BaseModel):
@@ -46,10 +63,3 @@ class Payment(BaseModel):
     status: Literal["pending", "confirmed", "failed"] = "pending"
     reference: Optional[str] = None
     notes: Optional[str] = None
-
-# Optional: Simple auth identities for future extension
-class UserIdentity(BaseModel):
-    provider: Literal["guest", "google", "phone"] = "guest"
-    uid: Optional[str] = None
-    phone: Optional[str] = None
-    email: Optional[EmailStr] = None

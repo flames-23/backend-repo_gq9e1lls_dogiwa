@@ -1,13 +1,16 @@
 import os
-from typing import List, Optional, Literal, Any, Dict
-from fastapi import FastAPI, HTTPException, Query
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Literal, Any, Dict
+from fastapi import FastAPI, HTTPException, Query, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from bson import ObjectId
 
 from database import db, create_document
-from schemas import Vendor, Payment
-from pymongo import GEOSPHERE
+from schemas import Vendor, Payment, User, UserOut, LoginRequest
+from pymongo import GEOSPHERE, ASCENDING
+from passlib.context import CryptContext
+import jwt
 
 app = FastAPI(title="Madad MVP API")
 
@@ -19,22 +22,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Ensure geospatial index on vendor.location
+# Config
+JWT_SECRET = os.getenv("JWT_SECRET", "dev_secret_change_me")
+JWT_ALGO = os.getenv("JWT_ALGO", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "43200"))  # 30 days by default
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# Indexes
 if db is not None:
     try:
         db["vendor"].create_index([("location", GEOSPHERE)])
+        db["user"].create_index([("email", ASCENDING)], unique=True, sparse=True)
+        db["user"].create_index([("phone", ASCENDING)], unique=True, sparse=True)
     except Exception:
         pass
-
-
-class UpdateVendor(BaseModel):
-    approved: Optional[bool] = None
-    verified: Optional[bool] = None
-    payment_status: Optional[Literal["unpaid", "active", "expired"]] = None
-    name: Optional[str] = None
-    phone: Optional[str] = None
-    address: Optional[str] = None
-    description: Optional[str] = None
 
 
 def serialize_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -45,8 +46,33 @@ def serialize_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(_id, ObjectId):
         doc["id"] = str(_id)
         del doc["_id"]
-    # Ensure any nested object ids are converted if needed later
     return doc
+
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def verify_password(password: str, hashed: str) -> bool:
+    return pwd_context.verify(password, hashed)
+
+
+def create_access_token(sub: str) -> str:
+    now = datetime.now(timezone.utc)
+    exp = now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    payload = {"sub": sub, "exp": exp}
+    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+    return token
+
+
+class UpdateVendor(BaseModel):
+    approved: Optional[bool] = None
+    verified: Optional[bool] = None
+    payment_status: Optional[Literal["unpaid", "active", "expired"]] = None
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    description: Optional[str] = None
 
 
 @app.get("/")
@@ -83,12 +109,91 @@ def test_database():
     return response
 
 
-# Vendors
-@app.post("/api/vendors")
-def create_vendor(vendor: Vendor):
+# ---------- AUTH ----------
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserOut
+
+
+def get_current_user(authorization: Optional[str] = Header(None)) -> Optional[Dict[str, Any]]:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        return None
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+        sub = payload.get("sub")
+        if not sub or db is None:
+            return None
+        doc = db["user"].find_one({"_id": ObjectId(sub)})
+        return doc
+    except Exception:
+        return None
+
+
+@app.post("/api/auth/register", response_model=TokenResponse)
+def register(user: User):
     if db is None:
         raise HTTPException(status_code=500, detail="Database not available")
-    # Insert and return created
+    # Ensure either email or phone present
+    if not user.email and not user.phone:
+        raise HTTPException(status_code=400, detail="Email or phone is required")
+    # Uniqueness checks
+    if user.email and db["user"].find_one({"email": user.email}):
+        raise HTTPException(status_code=409, detail="Email already registered")
+    if user.phone and db["user"].find_one({"phone": user.phone}):
+        raise HTTPException(status_code=409, detail="Phone already registered")
+
+    data = user.model_dump()
+    raw_password = data.pop("password")
+    data["hashed_password"] = hash_password(raw_password)
+    data["created_at"] = datetime.now(timezone.utc)
+    data["updated_at"] = datetime.now(timezone.utc)
+
+    res = db["user"].insert_one(data)
+    uid = str(res.inserted_id)
+
+    token = create_access_token(uid)
+    user_out = UserOut(id=uid, name=data.get("name"), email=data.get("email"), phone=data.get("phone"))
+    return {"access_token": token, "token_type": "bearer", "user": user_out}
+
+
+@app.post("/api/auth/login", response_model=TokenResponse)
+def login(req: LoginRequest):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    if not req.email and not req.phone:
+        raise HTTPException(status_code=400, detail="Email or phone is required")
+
+    q: Dict[str, Any] = {"email": req.email} if req.email else {"phone": req.phone}
+    doc = db["user"].find_one(q)
+    if not doc:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    hashed = doc.get("hashed_password")
+    if not hashed or not verify_password(req.password, hashed):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    uid = str(doc["_id"])
+
+    token = create_access_token(uid)
+    user_out = UserOut(id=uid, name=doc.get("name"), email=doc.get("email"), phone=doc.get("phone"))
+    return {"access_token": token, "token_type": "bearer", "user": user_out}
+
+
+@app.get("/api/auth/me", response_model=UserOut)
+def me(current = Depends(get_current_user)):
+    if not current:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    doc = serialize_doc(current)
+    return UserOut(id=doc["id"], name=doc.get("name"), email=doc.get("email"), phone=doc.get("phone"))
+
+
+# ---------- VENDORS ----------
+@app.post("/api/vendors")
+def create_vendor(vendor: Vendor, current = Depends(get_current_user)):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    if not current:
+        raise HTTPException(status_code=401, detail="Unauthorized")
     vid = create_document("vendor", vendor)
     doc = db["vendor"].find_one({"_id": ObjectId(vid)})
     return serialize_doc(doc)
@@ -108,9 +213,11 @@ def get_vendor(vendor_id: str):
 
 
 @app.patch("/api/vendors/{vendor_id}")
-def update_vendor(vendor_id: str, payload: UpdateVendor):
+def update_vendor(vendor_id: str, payload: "UpdateVendor", current = Depends(get_current_user)):
     if db is None:
         raise HTTPException(status_code=500, detail="Database not available")
+    if not current:
+        raise HTTPException(status_code=401, detail="Unauthorized")
     try:
         update = {k: v for k, v in payload.model_dump(exclude_none=True).items()}
         if not update:
@@ -155,7 +262,7 @@ def nearby_vendors(
     return {"count": len(results), "vendors": results}
 
 
-# Simple admin list views (no auth for MVP preview)
+# Admin list (left open for now)
 @app.get("/api/admin/vendors")
 def admin_list_vendors(status: Optional[str] = Query(None, description="pending|active|all")):
     if db is None:
@@ -169,11 +276,13 @@ def admin_list_vendors(status: Optional[str] = Query(None, description="pending|
     return [serialize_doc(d) for d in cursor]
 
 
-# Payment record creation (manual confirmation in MVP)
+# Payments
 @app.post("/api/payments")
-def create_payment(payment: Payment):
+def create_payment(payment: Payment, current = Depends(get_current_user)):
     if db is None:
         raise HTTPException(status_code=500, detail="Database not available")
+    if not current:
+        raise HTTPException(status_code=401, detail="Unauthorized")
     pid = create_document("payment", payment)
     doc = db["payment"].find_one({"_id": ObjectId(pid)})
     return serialize_doc(doc)
