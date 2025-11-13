@@ -1,48 +1,55 @@
 """
 Database Schemas
 
-Define your MongoDB collection schemas here using Pydantic models.
-These schemas are used for data validation in your application.
+Madad MVP collections using MongoDB with Pydantic models for validation.
+Each Pydantic model name maps to a MongoDB collection with the lowercase name.
 
-Each Pydantic model represents a collection in your database.
-Model name is converted to lowercase for the collection name:
-- User -> "user" collection
-- Product -> "product" collection
-- BlogPost -> "blogs" collection
+Collections:
+- Vendor: registered service providers with geolocation (GeoJSON Point)
+- Payment: records of vendor subscription payments (MVP: manual status tracking)
 """
 
-from pydantic import BaseModel, Field
-from typing import Optional
+from pydantic import BaseModel, Field, EmailStr
+from typing import Optional, Literal, List, Dict, Any
 
-# Example schemas (replace with your own):
+ServiceType = Literal[
+    "tow_truck",
+    "mechanic",
+    "hotel",
+    "medical",
+    "car_wash",
+    "electrician",
+    "plumber",
+]
 
-class User(BaseModel):
-    """
-    Users collection schema
-    Collection name: "user" (lowercase of class name)
-    """
-    name: str = Field(..., description="Full name")
-    email: str = Field(..., description="Email address")
-    address: str = Field(..., description="Address")
-    age: Optional[int] = Field(None, ge=0, le=120, description="Age in years")
-    is_active: bool = Field(True, description="Whether user is active")
+class GeoPoint(BaseModel):
+    type: Literal["Point"] = "Point"
+    # GeoJSON expects [longitude, latitude]
+    coordinates: List[float] = Field(..., min_items=2, max_items=2, description="[lng, lat]")
 
-class Product(BaseModel):
-    """
-    Products collection schema
-    Collection name: "product" (lowercase of class name)
-    """
-    title: str = Field(..., description="Product title")
-    description: Optional[str] = Field(None, description="Product description")
-    price: float = Field(..., ge=0, description="Price in dollars")
-    category: str = Field(..., description="Product category")
-    in_stock: bool = Field(True, description="Whether product is in stock")
+class Vendor(BaseModel):
+    name: str = Field(..., description="Vendor display name")
+    phone: str = Field(..., description="Primary contact phone number in local format")
+    service_type: ServiceType = Field(..., description="Primary service category")
+    location: GeoPoint = Field(..., description="GeoJSON point for the vendor location")
+    address: Optional[str] = Field(None, description="Text address or area name")
+    description: Optional[str] = Field(None, description="Short description or specialties")
+    approved: bool = Field(False, description="Admin approval status")
+    verified: bool = Field(False, description="Manual vendor verification status")
+    # MVP payments: manual approval; future: integrate Easypaisa/JazzCash
+    payment_status: Literal["unpaid", "active", "expired"] = Field("unpaid")
 
-# Add your own schemas here:
-# --------------------------------------------------
+class Payment(BaseModel):
+    vendor_id: str = Field(..., description="Reference to vendor _id as string")
+    amount_pkr: int = Field(..., ge=0)
+    method: Literal["easypaisa", "jazzcash", "manual"] = "manual"
+    status: Literal["pending", "confirmed", "failed"] = "pending"
+    reference: Optional[str] = None
+    notes: Optional[str] = None
 
-# Note: The Flames database viewer will automatically:
-# 1. Read these schemas from GET /schema endpoint
-# 2. Use them for document validation when creating/editing
-# 3. Handle all database operations (CRUD) directly
-# 4. You don't need to create any database endpoints!
+# Optional: Simple auth identities for future extension
+class UserIdentity(BaseModel):
+    provider: Literal["guest", "google", "phone"] = "guest"
+    uid: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[EmailStr] = None
